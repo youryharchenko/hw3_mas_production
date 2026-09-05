@@ -55,7 +55,7 @@ class TrajectoryLogger(BaseCallbackHandler):
         start_time = self._start_times.pop(run_id, time.perf_counter())
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
         node_input = self._inputs.pop(run_id, None)
-
+        inputs = self._clean_data(node_input)
         # Визначаємо назву вузла (або використовуємо дефолтну)
         node_name = kwargs.get("name") or "Chain/Node"
 
@@ -63,11 +63,14 @@ class TrajectoryLogger(BaseCallbackHandler):
 
         log_entry = {
             "step_number": self.step_counter,
+            "agent_name": inputs.get("current_agent", "super")
+            if hasattr(inputs, "get")
+            else "super",
             "event_type": "node_execution",
             "node_name": node_name,
             "timestamp": self._get_timestamp(),
             "duration_ms": duration_ms,
-            "input": self._clean_data(node_input),
+            "input": inputs,
             "output": self._clean_data(outputs),
             # "tool_calls": [],  # Можна витягнути з outputs, якщо вузол повертає AIMessage з tool_calls
         }

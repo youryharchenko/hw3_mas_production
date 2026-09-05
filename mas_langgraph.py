@@ -2,6 +2,7 @@ import copy
 import operator
 import re
 import sqlite3
+import sys
 from typing import Annotated, Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -13,6 +14,8 @@ from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from base_agent import BaseGraphAgent
+
+# from fake_llm import llm
 from kb import search_templates
 from llm import llm
 from logger import logger
@@ -23,7 +26,7 @@ MAX_STEPS = 3
 
 
 class SuperState(TypedDict):
-    messages: Annotated[list[str], operator.add]
+    messages: Annotated[list[str], add_messages]
     current_agent: str
     topic: str
     plan: list[str]  # список кроків плану
@@ -40,7 +43,7 @@ class SuperState(TypedDict):
 class RouteDecision(BaseModel):
     """Рішення супервізора, до якого агента надіслати запит."""
 
-    action: Literal["plan", "exec", "eval", "general"] = Field(
+    action: Literal["plan", "exec", "eval", "finish", "general"] = Field(
         description='Цільовий агент або "general" для нерозпізнаних запитів',
     )
     reasoning: str = Field(description="Коротке пояснення вибору")
@@ -113,14 +116,15 @@ class SuperAgent(BaseGraphAgent):
                     " Маршрутизуй запит:\n"
                     "- початок роботи, розробка плану: action = 'plan' \n"
                     "- якщо план вже є, то робимо виконання пунктів плану: action = 'exec' \n"
-                    "- якщо план виконано і задача вже створена, то робимо остаточну перевірку: action = 'eval'\n"
+                    "- якщо задача вже створена, то робимо остаточну перевірку: action = 'eval'\n"
+                    "- якщо задача вже створена і перевірена, то закінчуємо роботу: action = 'finish'\n"
                     "- general: вітання, нерозпізнані запити\n"
                     "Поверни RouteDecision з action та коротким reasoning.\n"
                 )
             ),
             HumanMessage(
                 content=(
-                    f"Тема: {messages[0]},\nКрок:{current_item_idx}\nПлан: \n{' '.join(plan)}, Задача: {task}, Остання дія: {last_message}\n"
+                    f"Тема: {messages[0]},\nКрок: {current_item_idx}\nПлан: {len(plan)}\n{' '.join(plan)}, Задача: {task}, Остання дія: {last_message}\n"
                 )
             ),
         ]
@@ -159,6 +163,14 @@ class SuperAgent(BaseGraphAgent):
                         "current_agent": "evaluator",
                         "step_count": 0,
                         "messages": [f"Перевір задачу на коректність {task}"],
+                    },
+                )
+            case "finish":
+                return Command(
+                    goto=END,
+                    update={
+                        "step_count": 0,
+                        "messages": ["Завершення роботи"],
                     },
                 )
             case _:
@@ -480,7 +492,7 @@ class ExecutorAgent(BaseGraphAgent):
                     )
                 ),
                 HumanMessage(
-                    content=f"Контекст виконання:\n{past_context}\n\nПоточне завдання: {current_step}"
+                    content=f"Контекст виконання:\n{last_message}\n\nПоточне завдання: {current_step}"
                 ),
             ]
             response = llm.with_structured_output(GeneratedMathProblem).invoke(prompt)
@@ -496,7 +508,7 @@ class ExecutorAgent(BaseGraphAgent):
                     "tool_call_count": 0,
                     "current_item_idx": idx + 1,
                     "current_agent": "super",
-                    "messages": "Завершено виконання плану",
+                    "messages": ["Задача створена, потрібна перевірка"],
                 },
             )
 
@@ -580,14 +592,13 @@ class EvaluatorAgent(BaseGraphAgent):
 
         tool_call_count = state.get("tool_call_count", 0)
         last_message = state.get("messages")[-1]
-        plan = state["plan"]
-        topic = state["topic"]
-        grade = state["grade"]
+        # plan = state["plan"]
+        # topic = state["topic"]
+        # grade = state["grade"]
         task = state["task"]
-        idx = state["current_item_idx"]
-        current_step = plan[idx]
+        # idx = state["current_item_idx"]
 
-        print(f"Executor - last_message: {last_message}, task {task}")
+        print(f"Evaluator - last_message: {last_message}, task {task}")
 
         if (
             tool_call_count > 0
@@ -599,7 +610,7 @@ class EvaluatorAgent(BaseGraphAgent):
                 goto=END,
                 update={
                     "tool_call_count": 0,
-                    "current_item_idx": idx + 1,
+                    "current_item_idx": 0,
                     "current_agent": "super",
                     "messages": [
                         f"Результат виконання контролера: {last_message.content}"
@@ -623,7 +634,7 @@ class EvaluatorAgent(BaseGraphAgent):
             print("Нема запитів до консультанта")
             return Command(
                 goto=END,
-                update={"messages": "Нема запитів до консультанта"},
+                update={"messages": ["Нема запитів до консультанта"]},
             )
 
         prompt = [
@@ -670,21 +681,57 @@ class EvaluatorAgent(BaseGraphAgent):
             )
 
 
+def check_snapshot(state):
+    if state.values and state.next and state.tasks[0].interrupts:
+        return 0
+    elif state.values and state.next and not state.tasks[0].interrupts:
+        return 1
+    elif state.values and not state.next:
+        return 2
+    else:
+        return 3
+
+
 if __name__ == "__main__":
-    agent = SuperAgent("super", "th-01")
-    inputs = SuperState(
-        messages=["Арифметика: Проста задача на ділення"],
-        topic="",
-        grade=4,
-        current_agent="super",
-        current_item_idx=0,
-        eval_status="",
-        feedback="",
-        plan=[],
-        results=[],
-        step_count=0,
-        tool_call_count=0,
-        task=None,
-    )
-    result = agent.run(inputs)
-    # print(result)
+    # thread_id = "th-01"
+    # thread_id = "th-02"
+    thread_id = "th-03"
+    try:
+        agent = SuperAgent("super", thread_id)
+        state = agent.get_state()
+        mode = check_snapshot(state)
+        match mode:
+            case 1:
+                print(
+                    f"🚀 [Agent] Незавершений стан, продовжуємо. Thread: {thread_id})"
+                )
+                final_output = agent.cont()
+            case 2:
+                print(f"🚀 [Agent] Сессія вже завершена раніше. Thread: {thread_id})")
+                final_output = state.values
+            case 3:
+                print(f"🚀 [Agent] Нова сесія: запускаємо з нуля. Thread: {thread_id})")
+                inputs = SuperState(
+                    # messages=["Арифметика: Проста задача на ділення"],
+                    # messages=["Геометрія: Проста задача на площу прямокутника"],
+                    messages=["Алгебра: Проста задача на лінійне рівняння"],
+                    topic="",
+                    grade=5,
+                    current_agent="super",
+                    current_item_idx=0,
+                    eval_status="",
+                    feedback="",
+                    plan=[],
+                    results=[],
+                    step_count=0,
+                    tool_call_count=0,
+                    task=None,
+                )
+                final_output = agent.run(inputs)
+            case _:
+                final_output = ""
+    except KeyboardInterrupt:
+        print("💥 Програму зупинено користувачем.")
+        sys.exit(0)
+
+    print(final_output)
